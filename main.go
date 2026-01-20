@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand" // Added missing import
+	"math/rand"
 	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -17,6 +19,7 @@ import (
 )
 
 var db *sql.DB
+
 var (
 	bookingsSuccess int64
 	bookingsFailed  int64
@@ -25,7 +28,7 @@ var (
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	slog.SetDefault(logger) // Fixed: was slog.Default
+	slog.SetDefault(logger)
 
 	if err := godotenv.Load(); err != nil {
 		slog.Warn("Note: .env file not found.")
@@ -35,7 +38,7 @@ func main() {
 		os.Getenv("DB_HOST"), os.Getenv("DB_PORT"), os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD"), os.Getenv("DB_NAME"))
 
 	var err error
-	db, err = sql.Open("postgres", connStr) // Fixed: was "postgress"
+	db, err = sql.Open("postgres", connStr)
 	if err != nil {
 		slog.Error("Error opening database", "error", err)
 		os.Exit(1)
@@ -50,39 +53,54 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.Info("STARTING STRESS TEST", "TICKETS", totalTickets, "USER", 100)
+	slog.Info("STARTING ROBUST STRESS TEST (Week 4)", "tickets", totalTickets, "users", 100)
+
+	stopChan := make(chan os.Signal, 1)
+	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
 	start := time.Now()
-	runStressTest(eventID, 100)
+
+	go func() {
+		runStressTest(eventID, 100)
+		stopChan <- os.Interrupt
+	}()
+
+	<-stopChan
+	slog.Info("Shutting down... (Test Finished or Interrupted)")
+
 	duration := time.Since(start)
 
 	verifyResults(eventID, totalTickets)
 	fmt.Println("\n---------------------------------------------------")
-	fmt.Printf(" Execution Time: %v\n", duration)
-	fmt.Printf(" Successful Bookings: %d\n", bookingsSuccess)
-	fmt.Printf(" Failed Bookings:     %d\n", bookingsFailed)
-	fmt.Printf(" Retries (Conflicts): %d\n", retryCount)
+	fmt.Printf("Execution Time: %v\n", duration)
+	fmt.Printf("Successful Bookings: %d\n", bookingsSuccess)
+	fmt.Printf("Failed Bookings:     %d\n", bookingsFailed)
+	fmt.Printf("Retries (Conflicts): %d\n", retryCount)
 	fmt.Println("---------------------------------------------------")
 }
 
 func runStressTest(eventID int, concurrentUser int) {
 	var wg sync.WaitGroup
 
-	for i := 0; i < concurrentUser; i++ { // Fixed: was <= (off-by-one)
+	for i := 0; i < concurrentUser; i++ {
 		wg.Add(1)
 		userID := 1000 + i
 
 		go func(uID int) {
 			defer wg.Done()
+
+			idempotencyKey := fmt.Sprintf("event-%d-user-%d", eventID, uID)
+
 			maxRetries := 5
 			for attempt := 0; attempt <= maxRetries; attempt++ {
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				err := BookingTickets(ctx, eventID, uID)
+
+				err := BookTicketIdempotent(ctx, eventID, uID, idempotencyKey)
 				cancel()
 
 				if err == nil {
 					atomic.AddInt64(&bookingsSuccess, 1)
-					slog.Info("Got Ticket!", "user_id", uID)
+					slog.Info("GOT TICKET!", "user_id", uID)
 					return
 				}
 
@@ -97,21 +115,29 @@ func runStressTest(eventID int, concurrentUser int) {
 				return
 			}
 
-			slog.Error("GAVE UP (Too many retries)", "user_id", uID)
+			slog.Error("GAVE UP", "user_id", uID)
 			atomic.AddInt64(&bookingsFailed, 1)
 		}(userID)
 	}
-	wg.Wait() // Fixed: was wait()
+	wg.Wait()
 }
 
-func BookingTickets(ctx context.Context, eventID int, userID int) error {
+func BookTicketIdempotent(ctx context.Context, eventID int, userID int, idenKey string) error {
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{
-		Isolation: sql.LevelSerializable, // Fixed: was LevelLinearizable
+		Isolation: sql.LevelSerializable,
 	})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+
+	var existingID int
+	err = tx.QueryRowContext(ctx, "SELECT id FROM bookings WHERE idempotency_key=$1", idenKey).Scan(&existingID)
+
+	if err == nil {
+		slog.Info("Idempotency Triggered: Request already processed", "user_id", userID)
+		return nil
+	}
 
 	var available int
 	err = tx.QueryRowContext(ctx, "SELECT available_tickets FROM events WHERE id=$1", eventID).Scan(&available)
@@ -120,7 +146,7 @@ func BookingTickets(ctx context.Context, eventID int, userID int) error {
 	}
 
 	if available <= 0 {
-		return errors.New("Sold out")
+		return errors.New("sold out")
 	}
 
 	_, err = tx.ExecContext(ctx, "UPDATE events SET available_tickets = available_tickets - 1 where id=$1", eventID)
@@ -128,7 +154,8 @@ func BookingTickets(ctx context.Context, eventID int, userID int) error {
 		return err
 	}
 
-	_, err = tx.ExecContext(ctx, "INSERT INTO bookings (event_id, user_id) VALUES ($1, $2)", eventID, userID)
+	_, err = tx.ExecContext(ctx, "INSERT INTO bookings (event_id, user_id, idempotency_key) VALUES ($1, $2, $3)",
+		eventID, userID, idenKey)
 	if err != nil {
 		return err
 	}
